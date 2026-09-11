@@ -13,14 +13,21 @@ publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 dunce = { workspace = true }
 image = { workspace = true }
+koharu-config = { workspace = true }
+koharu-ml = { workspace = true }
+koharu-pipeline = { workspace = true }
 koharu-scene = { workspace = true }
 koharu-storage = { workspace = true }
+koharu-translator = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

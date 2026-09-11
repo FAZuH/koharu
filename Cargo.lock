@@ -4987,17 +4987,24 @@ name = "koharu-rpc"
 version = "0.82.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "dunce",
  "image",
+ "koharu-config",
+ "koharu-ml",
+ "koharu-pipeline",
  "koharu-scene",
  "koharu-storage",
+ "koharu-translator",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tower",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
