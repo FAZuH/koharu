@@ -1,3 +1,7 @@
+// The wgpu type graph behind `Rasterizer` (now held by `ServerState`) overflows
+// the default auto-trait recursion depth during `Send` evaluation (rust-lang#159228).
+#![recursion_limit = "256"]
+
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -18,20 +22,29 @@ use axum::{
     routing::{delete, get, post},
 };
 use clap::Parser;
-use image::{ImageFormat, ImageReader};
+use image::{
+    ExtendedColorType, ImageEncoder as _, ImageFormat, ImageReader,
+    codecs::png::{CompressionType, FilterType, PngEncoder},
+};
 use koharu_config::Config;
 use koharu_ml::Device;
 use koharu_pipeline::{
     Committer, Operation, Pipeline, PipelineConfig, Progress, ProgressSink, Report,
     Request as PipelineRequest, RunStatus, Scope, Stage, StageOutput, StopToken,
 };
+use koharu_psd::{PsdExportOptions, export_page};
+use koharu_rasterizer::{RasterOptions, Rasterizer};
+use koharu_renderer::Renderer;
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, EntityId, PageDraft, Session, Snapshot,
 };
 use koharu_translator::{Language, ProvidersConfig};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, OnceCell},
+};
 
 const DEFAULT_PORT: u16 = 4100;
 const PROGRESS_RING_CAPACITY: usize = 32;
@@ -355,6 +368,7 @@ struct ServerState {
     /// run-scoped translation override on `koharu_pipeline::Request` or a
     /// watcher-free constructor — is an upstream proposal.
     overridden: StdMutex<Option<(OverrideKey, Pipeline)>>,
+    export: OnceCell<ExportEngine>,
     runner: Runner,
 }
 
@@ -366,6 +380,7 @@ impl ServerState {
             pipeline,
             device,
             overridden: StdMutex::new(None),
+            export: OnceCell::new(),
             runner,
         }
     }
@@ -481,6 +496,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/operations", get(list_operations))
         .route("/api/v1/operations/{id}", delete(stop_operation))
         .route("/api/v1/pages/{id}/image", get(page_image))
+        .route("/api/v1/export", post(export))
         .fallback(not_found)
         .with_state(state)
 }
@@ -941,12 +957,238 @@ async fn page_image(
     Ok(([(header::CONTENT_TYPE, asset.media_type)], bytes).into_response())
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExportFormat {
+    Png,
+    Psd,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportRequest {
+    pages: Option<Vec<EntityId>>,
+    dir: Option<String>,
+    format: Option<ExportFormat>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportResponse {
+    files: Vec<String>,
+}
+
+/// Renderer and Rasterizer for exports, built once per process on first use:
+/// `Rasterizer::new` acquires a GPU device and `Renderer::new` spawns a
+/// typesetting-config watcher, so neither is paid at startup or by an export
+/// that never happens.
+struct ExportEngine {
+    renderer: Renderer,
+    rasterizer: Arc<Rasterizer>,
+}
+
+/// One parked watcher per export-engine construction, at most one per process.
+async fn export_engine(state: &AppState) -> Result<&ExportEngine, ApiError> {
+    state
+        .export
+        .get_or_try_init(|| async {
+            Ok::<_, ApiError>(ExportEngine {
+                renderer: Renderer::new().map_err(engine_error)?,
+                rasterizer: Arc::new(Rasterizer::new().map_err(engine_error)?),
+            })
+        })
+        .await
+}
+
+fn engine_error(error: impl std::error::Error + Send + Sync + 'static) -> ApiError {
+    // `{:#}` walks the anyhow source chain; Display alone hides the root cause.
+    let error = anyhow::Error::new(error);
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("export failed: {error:#}"),
+    )
+}
+
+/// File stem for an exported page: 1-based position plus the sanitized page
+/// label, matching the desktop export naming.
+fn export_stem(index: usize, label: &str) -> String {
+    let name = label
+        .trim()
+        .trim_end_matches(|character: char| character == '.' || character.is_whitespace());
+    let name = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let name = name
+        .chars()
+        .map(|character| {
+            if matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            ) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    format!(
+        "{:04}_{}",
+        index + 1,
+        if name.is_empty() { "page" } else { &name }
+    )
+}
+
+/// Export renders the selected pages from an immutable snapshot and writes
+/// them outside project storage, so it is allowed while a pipeline run is
+/// active; the result may be a mid-run partial render.
+async fn export(
+    State(state): State<AppState>,
+    JsonBody(request): JsonBody<ExportRequest>,
+) -> Result<Json<ExportResponse>, ApiError> {
+    if request.pages.as_ref().is_some_and(Vec::is_empty) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "pages must not be empty",
+        ));
+    }
+    let format = request.format.unwrap_or(ExportFormat::Png);
+    let current = state.project.lock().await;
+    let Some(project) = current.as_ref() else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "no project is open"));
+    };
+    let directory = request
+        .dir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project.path.join("exports"));
+    if !directory.is_absolute() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("export path must be absolute: {}", directory.display()),
+        ));
+    }
+    let snapshot = project.session.snapshot();
+    drop(current);
+    let pages = match request.pages {
+        Some(pages) => pages,
+        None => snapshot.pages().map(|page| page.id()).collect(),
+    };
+    if let Some(missing) = pages
+        .iter()
+        .find(|id| snapshot.page(**id).map_err(scene_error).is_err())
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("page not found: {missing}"),
+        ));
+    }
+    if pages.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "there are no pages to export",
+        ));
+    }
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("cannot create {}: {error}", directory.display()),
+            )
+        })?;
+    let engine = export_engine(&state).await?;
+    let mut files = Vec::with_capacity(pages.len());
+    for (index, page) in pages.iter().enumerate() {
+        let label = snapshot
+            .page(*page)
+            .and_then(|page| page.page())
+            .map_err(scene_error)?
+            .label;
+        let path = directory.join(match format {
+            ExportFormat::Png => format!("{}.png", export_stem(index, &label)),
+            ExportFormat::Psd => format!("{}.psd", export_stem(index, &label)),
+        });
+        let frame = engine
+            .renderer
+            .render(&snapshot, *page)
+            .await
+            .map_err(engine_error)?;
+        let bytes = match format {
+            ExportFormat::Png => {
+                let raster_frame = frame.raster_frame().map_err(engine_error)?;
+                let rasterizer = Arc::clone(&engine.rasterizer);
+                tokio::task::spawn_blocking(move || {
+                    rasterizer
+                        .rasterize(&raster_frame, RasterOptions::default())
+                        .map(|raster| raster.image)
+                        .map_err(engine_error)
+                        .and_then(encode_png)
+                })
+                .await
+                .map_err(|error| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                })??
+            }
+            ExportFormat::Psd => export_page(
+                Arc::clone(&engine.rasterizer),
+                &snapshot,
+                &frame,
+                &PsdExportOptions::default(),
+            )
+            .await
+            .map_err(engine_error)?,
+        };
+        write_atomic(path.clone(), bytes).await?;
+        files.push(path.display().to_string());
+    }
+    Ok(Json(ExportResponse { files }))
+}
+
+/// PNG encode at the desktop's quality settings.
+fn encode_png(image: image::RgbaImage) -> Result<Vec<u8>, ApiError> {
+    let mut bytes = Vec::new();
+    PngEncoder::new_with_quality(
+        io::Cursor::new(&mut bytes),
+        CompressionType::Best,
+        FilterType::Adaptive,
+    )
+    .write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        ExtendedColorType::Rgba8,
+    )
+    .map_err(engine_error)?;
+    Ok(bytes)
+}
+
+/// Writes through a unique temp file and renames, so concurrent exports of
+/// one page cannot interleave into the same destination path.
+async fn write_atomic(path: PathBuf, bytes: Vec<u8>) -> Result<(), ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let io_error = |error: io::Error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("failed to write {}: {error}", path.display()),
+            )
+        };
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
+        std::fs::write(&temporary, bytes).map_err(io_error)?;
+        std::fs::rename(&temporary, &path).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            io_error(error)
+        })?;
+        Ok::<_, ApiError>(())
+    })
+    .await
+    .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))??;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         At, Committer, Config, EntityId, Language, Operation, PageDraft, Pipeline, PipelineConfig,
         PipelineRequest, Progress, ProjectCommitter, ProvidersConfig, Report, RunStatus, Runner,
-        Scope, ServerState, Snapshot, Stage, StageOutput, memo_hit, router,
+        Scope, ServerState, Snapshot, Stage, StageOutput, export_stem, memo_hit, router,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -955,7 +1197,9 @@ mod tests {
     use koharu_ml::Device;
     use serde_json::{Value, json};
     use std::{
+        fs,
         future::Future,
+        io::Cursor,
         path::{Path, PathBuf},
         sync::{Arc, Mutex as StdMutex},
         time::Duration,
@@ -1715,5 +1959,210 @@ mod tests {
 
         let (_, operations) = send(&app, get("/api/v1/operations")).await;
         assert_eq!(operations.as_array().unwrap().len(), 0);
+    }
+
+    fn png_dimensions(path: &Path) -> (u32, u32) {
+        let bytes = fs::read(path).unwrap();
+        assert!(!bytes.is_empty());
+        image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn export_renders_numbered_files_matching_the_page_dimensions() {
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let app = app();
+        open_project_with_pages(&app, root.path()).await;
+
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/v1/export",
+                json!({"dir": out.path().display().to_string()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        let names: Vec<String> = files
+            .iter()
+            .map(|file| {
+                Path::new(file.as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, ["0001_page-a.png", "0002_page-b.png"]);
+        assert_eq!(
+            png_dimensions(Path::new(files[0].as_str().unwrap())),
+            (3, 4)
+        );
+        assert_eq!(
+            png_dimensions(Path::new(files[1].as_str().unwrap())),
+            (8, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn export_honors_the_page_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let app = app();
+        let pages = open_project_with_pages(&app, root.path()).await;
+
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/v1/export",
+                json!({"dir": out.path().display().to_string(), "pages": [pages[1]]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].as_str().unwrap().ends_with("0001_page-b.png"));
+        assert_eq!(
+            png_dimensions(Path::new(files[0].as_str().unwrap())),
+            (8, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn export_defaults_to_the_project_exports_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let app = app();
+        open_project_with_pages(&app, root.path()).await;
+
+        let (status, body) = send(&app, post_json("/api/v1/export", json!({}))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        for file in body["files"].as_array().unwrap() {
+            let file = Path::new(file.as_str().unwrap());
+            assert_eq!(
+                file.parent().unwrap(),
+                &root.path().join("project").join("exports")
+            );
+            assert!(file.is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn export_writes_psd_files_when_requested() {
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let app = app();
+        open_project_with_pages(&app, root.path()).await;
+
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/v1/export",
+                json!({"dir": out.path().display().to_string(), "format": "psd"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        for (file, (page_width, page_height)) in files.iter().zip([(3u32, 4u32), (8, 2)]) {
+            let bytes = fs::read(file.as_str().unwrap()).unwrap();
+            assert!(!bytes.is_empty());
+            // PSD header: "8BPS", version 1, 6 reserved bytes, channels,
+            // height, width, depth, mode (koharu-psd `write_header`).
+            assert_eq!(&bytes[..4], b"8BPS");
+            assert_eq!(&bytes[4..6], [0, 1]);
+            assert!(bytes[6..12].iter().all(|byte| *byte == 0));
+            let channels = u16::from_be_bytes([bytes[12], bytes[13]]);
+            let height = u32::from_be_bytes(bytes[14..18].try_into().unwrap());
+            let width = u32::from_be_bytes(bytes[18..22].try_into().unwrap());
+            assert_eq!(&bytes[22..24], [0, 8]);
+            assert_eq!(&bytes[24..26], [0, 3]);
+            assert!((3..=4).contains(&channels));
+            assert_eq!((width, height), (page_width, page_height));
+        }
+    }
+
+    #[tokio::test]
+    async fn export_without_project_returns_404() {
+        let app = app();
+
+        let (status, body) = send(&app, post_json("/api/v1/export", json!({}))).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(body["message"], "no project is open");
+    }
+
+    #[tokio::test]
+    async fn export_rejects_a_relative_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let app = app();
+        open_project_with_pages(&app, root.path()).await;
+
+        let (status, body) = send(&app, post_json("/api/v1/export", json!({"dir": "out"}))).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["message"], "export path must be absolute: out");
+    }
+
+    #[tokio::test]
+    async fn export_rejects_an_unwritable_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let app = app();
+        open_project_with_pages(&app, root.path()).await;
+
+        let blocker = write_png(out.path(), "blocker", 1, 1);
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/v1/export",
+                json!({"dir": blocker.join("exports").display().to_string()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("cannot create ")
+        );
+    }
+
+    #[tokio::test]
+    async fn export_rejects_an_unknown_page_id() {
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let app = app();
+        open_project_with_pages(&app, root.path()).await;
+
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/v1/export",
+                json!({
+                    "dir": out.path().display().to_string(),
+                    "pages": ["00000000-0000-0000-0000-000000000000"],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            body["message"],
+            "page not found: 00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn export_stem_numbers_pages_and_sanitizes_labels() {
+        assert_eq!(export_stem(0, "page-a"), "0001_page-a");
+        assert_eq!(export_stem(1, "  weird:name.png "), "0002_weird_name");
+        assert_eq!(export_stem(2, "..."), "0003_page");
     }
 }

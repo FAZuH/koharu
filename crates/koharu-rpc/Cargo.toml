@@ -21,6 +21,9 @@ image = { workspace = true }
 koharu-config = { workspace = true }
 koharu-ml = { workspace = true }
 koharu-pipeline = { workspace = true }
+koharu-psd = { workspace = true }
+koharu-rasterizer = { workspace = true, features = ["native"] }
+koharu-renderer = { workspace = true }
 koharu-scene = { workspace = true }
 koharu-storage = { workspace = true }
 koharu-translator = { workspace = true }
