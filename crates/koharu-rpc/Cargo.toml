@@ -15,9 +15,14 @@ publish.workspace = true
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
+dunce = { workspace = true }
+image = { workspace = true }
+koharu-scene = { workspace = true }
+koharu-storage = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tower = { workspace = true }

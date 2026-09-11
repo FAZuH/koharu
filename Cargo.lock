@@ -4989,8 +4989,13 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "dunce",
+ "image",
+ "koharu-scene",
+ "koharu-storage",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
 ]
