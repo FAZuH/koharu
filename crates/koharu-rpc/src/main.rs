@@ -39,12 +39,15 @@ use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, EntityId, PageDraft, Session, Snapshot,
 };
 use koharu_translator::{Language, ProvidersConfig};
+use rmcp::schemars;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, OnceCell},
 };
+
+mod mcp;
 
 const DEFAULT_PORT: u16 = 4100;
 const PROGRESS_RING_CAPACITY: usize = 32;
@@ -446,6 +449,9 @@ async fn main() -> Result<()> {
 
     let listener = bind(&arguments.host, arguments.port).await?;
 
+    // Binding first reports a busy port before this prefetch, so the socket
+    // stays unanswered until the runtime and configured weights are ready.
+    eprintln!("warming the native runtime; the first run can take several minutes");
     koharu_ml::init().await?;
     let device = koharu_ml::device(arguments.cpu);
     let pipeline = Pipeline::load(device.clone())?;
@@ -457,11 +463,10 @@ async fn main() -> Result<()> {
 
     axum::serve(
         listener,
-        router(Arc::new(ServerState::new(
-            pipeline,
-            device,
-            Runner::execute(),
-        ))),
+        router(
+            Arc::new(ServerState::new(pipeline, device, Runner::execute())),
+            arguments.host,
+        ),
     )
     .with_graceful_shutdown(async {
         tokio::signal::ctrl_c()
@@ -486,19 +491,23 @@ async fn bind(host: &IpAddr, port: u16) -> io::Result<TcpListener> {
     })
 }
 
-fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/api/v1/health", get(health))
-        .route("/api/v1/project", get(get_project))
-        .route("/api/v1/project/open", post(open_project))
-        .route("/api/v1/project/pages", post(add_pages))
-        .route("/api/v1/pipelines", post(start_pipeline))
-        .route("/api/v1/operations", get(list_operations))
-        .route("/api/v1/operations/{id}", delete(stop_operation))
-        .route("/api/v1/pages/{id}/image", get(page_image))
-        .route("/api/v1/export", post(export))
-        .fallback(not_found)
-        .with_state(state)
+fn router(state: AppState, bound_host: IpAddr) -> Router {
+    mcp::mount(
+        Router::new()
+            .route("/api/v1/health", get(health))
+            .route("/api/v1/project", get(get_project))
+            .route("/api/v1/project/open", post(open_project))
+            .route("/api/v1/project/pages", post(add_pages))
+            .route("/api/v1/pipelines", post(start_pipeline))
+            .route("/api/v1/operations", get(list_operations))
+            .route("/api/v1/operations/{id}", delete(stop_operation))
+            .route("/api/v1/pages/{id}/image", get(page_image))
+            .route("/api/v1/export", post(export))
+            .fallback(not_found)
+            .with_state(state.clone()),
+        state,
+        bound_host,
+    )
 }
 
 async fn health() -> Json<Health> {
@@ -533,17 +542,21 @@ struct ProjectView {
     pages: Vec<PageView>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct OpenProjectRequest {
+    #[schemars(description = "absolute path of the project directory")]
     path: String,
+    #[schemars(description = "create the project when the directory is missing (default false)")]
     create: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct AddPagesRequest {
+    #[schemars(description = "absolute paths of PNG, JPEG, or WebP image files")]
     paths: Vec<String>,
+    #[schemars(description = "insert before this page index; omit to append")]
     index: Option<usize>,
 }
 
@@ -617,6 +630,13 @@ async fn open_project(
     State(state): State<AppState>,
     JsonBody(request): JsonBody<OpenProjectRequest>,
 ) -> Result<Json<ProjectView>, ApiError> {
+    Ok(Json(open_project_service(&state, request).await?))
+}
+
+async fn open_project_service(
+    state: &AppState,
+    request: OpenProjectRequest,
+) -> Result<ProjectView, ApiError> {
     let create = request.create.unwrap_or(false);
     let path = PathBuf::from(request.path);
     if !path.is_absolute() {
@@ -670,7 +690,7 @@ async fn open_project(
     };
     let view = project_view(&project).map_err(scene_error)?;
     *current = Some(project);
-    Ok(Json(view))
+    Ok(view)
 }
 
 struct PreparedPage {
@@ -743,6 +763,13 @@ async fn add_pages(
     State(state): State<AppState>,
     JsonBody(request): JsonBody<AddPagesRequest>,
 ) -> Result<Json<AddPagesResponse>, ApiError> {
+    Ok(Json(add_pages_service(&state, request).await?))
+}
+
+async fn add_pages_service(
+    state: &AppState,
+    request: AddPagesRequest,
+) -> Result<AddPagesResponse, ApiError> {
     if request.paths.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -833,15 +860,28 @@ async fn add_pages(
         })
         .collect::<Result<Vec<_>, koharu_scene::Error>>()
         .map_err(scene_error)?;
-    Ok(Json(AddPagesResponse { pages }))
+    Ok(AddPagesResponse { pages })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct StartPipelineRequest {
+    #[schemars(
+        with = "Vec<String>",
+        description = "stages to run (detection, ocr, translation, inpainting); empty runs all"
+    )]
     stages: Vec<Stage>,
+    #[schemars(
+        with = "Option<Vec<String>>",
+        description = "page ids to run on; omit for the whole project"
+    )]
     pages: Option<Vec<EntityId>>,
+    #[schemars(
+        with = "Option<String>",
+        description = "target language override (e.g. en, ja, zh-CN)"
+    )]
     target_language: Option<Language>,
+    #[schemars(description = "translator system prompt override for this run")]
     system_prompt: Option<String>,
 }
 
@@ -855,6 +895,14 @@ async fn start_pipeline(
     State(state): State<AppState>,
     JsonBody(request): JsonBody<StartPipelineRequest>,
 ) -> Result<(StatusCode, Json<StartPipelineResponse>), ApiError> {
+    let response = start_pipeline_service(&state, request).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn start_pipeline_service(
+    state: &AppState,
+    request: StartPipelineRequest,
+) -> Result<StartPipelineResponse, ApiError> {
     if request.pages.as_ref().is_some_and(Vec::is_empty) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -910,24 +958,29 @@ async fn start_pipeline(
         project: Arc::clone(&state.project),
     };
     let job_id = id.clone();
-    let state = Arc::clone(&state);
+    let state = Arc::clone(state);
     tokio::spawn(async move {
         let outcome = (runner.0)(pipeline, snapshot, pipeline_request, committer).await;
         state.operations.finish(&job_id, outcome);
     });
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(StartPipelineResponse { operation_id: id }),
-    ))
+    Ok(StartPipelineResponse { operation_id: id })
 }
 
 async fn list_operations(State(state): State<AppState>) -> Json<Vec<OperationView>> {
-    Json(state.operations.view())
+    Json(list_operations_service(&state))
+}
+
+fn list_operations_service(state: &AppState) -> Vec<OperationView> {
+    state.operations.view()
 }
 
 async fn stop_operation(State(state): State<AppState>, Path(id): Path<String>) -> StatusCode {
-    state.operations.stop(&id);
+    stop_operation_service(&state, &id);
     StatusCode::NO_CONTENT
+}
+
+fn stop_operation_service(state: &AppState, id: &str) {
+    state.operations.stop(id);
 }
 
 async fn page_image(
@@ -957,18 +1010,24 @@ async fn page_image(
     Ok(([(header::CONTENT_TYPE, asset.media_type)], bytes).into_response())
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum ExportFormat {
     Png,
     Psd,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ExportRequest {
+    #[schemars(
+        with = "Option<Vec<String>>",
+        description = "page ids to export; omit for every page"
+    )]
     pages: Option<Vec<EntityId>>,
+    #[schemars(description = "absolute output directory; defaults to <project>/exports")]
     dir: Option<String>,
+    #[schemars(description = "output format (default png)")]
     format: Option<ExportFormat>,
 }
 
@@ -992,9 +1051,13 @@ async fn export_engine(state: &AppState) -> Result<&ExportEngine, ApiError> {
     state
         .export
         .get_or_try_init(|| async {
+            // Rasterizer first: if the GPU device cannot be acquired, the
+            // `Err` is not cached by `get_or_try_init` and a retry must not
+            // pay for a parked `Renderer` config-watcher each time.
+            let rasterizer = Arc::new(Rasterizer::new().map_err(engine_error)?);
             Ok::<_, ApiError>(ExportEngine {
                 renderer: Renderer::new().map_err(engine_error)?,
-                rasterizer: Arc::new(Rasterizer::new().map_err(engine_error)?),
+                rasterizer,
             })
         })
         .await
@@ -1036,13 +1099,20 @@ fn export_stem(index: usize, label: &str) -> String {
     )
 }
 
-/// Export renders the selected pages from an immutable snapshot and writes
-/// them outside project storage, so it is allowed while a pipeline run is
-/// active; the result may be a mid-run partial render.
 async fn export(
     State(state): State<AppState>,
     JsonBody(request): JsonBody<ExportRequest>,
 ) -> Result<Json<ExportResponse>, ApiError> {
+    Ok(Json(export_service(&state, request).await?))
+}
+
+/// Export renders the selected pages from an immutable snapshot and writes
+/// them outside project storage, so it is allowed while a pipeline run is
+/// active; the result may be a mid-run partial render.
+async fn export_service(
+    state: &AppState,
+    request: ExportRequest,
+) -> Result<ExportResponse, ApiError> {
     if request.pages.as_ref().is_some_and(Vec::is_empty) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1094,7 +1164,7 @@ async fn export(
                 format!("cannot create {}: {error}", directory.display()),
             )
         })?;
-    let engine = export_engine(&state).await?;
+    let engine = export_engine(state).await?;
     let mut files = Vec::with_capacity(pages.len());
     for (index, page) in pages.iter().enumerate() {
         let label = snapshot
@@ -1139,7 +1209,7 @@ async fn export(
         write_atomic(path.clone(), bytes).await?;
         files.push(path.display().to_string());
     }
-    Ok(Json(ExportResponse { files }))
+    Ok(ExportResponse { files })
 }
 
 /// PNG encode at the desktop's quality settings.
@@ -1171,7 +1241,10 @@ async fn write_atomic(path: PathBuf, bytes: Vec<u8>) -> Result<(), ApiError> {
             )
         };
         let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
-        std::fs::write(&temporary, bytes).map_err(io_error)?;
+        std::fs::write(&temporary, bytes).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            io_error(error)
+        })?;
         std::fs::rename(&temporary, &path).map_err(|error| {
             let _ = std::fs::remove_file(&temporary);
             io_error(error)
@@ -1186,15 +1259,18 @@ async fn write_atomic(path: PathBuf, bytes: Vec<u8>) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        At, Committer, Config, EntityId, Language, Operation, PageDraft, Pipeline, PipelineConfig,
-        PipelineRequest, Progress, ProjectCommitter, ProvidersConfig, Report, RunStatus, Runner,
-        Scope, ServerState, Snapshot, Stage, StageOutput, export_stem, memo_hit, router,
+        AddPagesRequest, At, Committer, Config, EntityId, ExportRequest, Ipv4Addr, Language,
+        OpenProjectRequest, Operation, PageDraft, Pipeline, PipelineConfig, PipelineRequest,
+        Progress, ProjectCommitter, ProvidersConfig, Report, RunStatus, Runner, Scope, ServerState,
+        Snapshot, Stage, StageOutput, StartPipelineRequest, export_stem, mcp::KoharuTools,
+        memo_hit, router,
     };
     use axum::{
         body::{Body, to_bytes},
         http::Request,
     };
     use koharu_ml::Device;
+    use rmcp::{handler::server::wrapper::Parameters, model::CallToolResult};
     use serde_json::{Value, json};
     use std::{
         fs,
@@ -1217,12 +1293,12 @@ mod tests {
         .expect("a memory-config pipeline needs no weights")
     }
 
+    fn state_with(runner: Runner) -> super::AppState {
+        Arc::new(ServerState::new(test_pipeline(), Device::cpu(), runner))
+    }
+
     fn app_with(runner: Runner) -> App {
-        router(Arc::new(ServerState::new(
-            test_pipeline(),
-            Device::cpu(),
-            runner,
-        )))
+        router(state_with(runner), Ipv4Addr::LOCALHOST.into())
     }
 
     fn app() -> App {
@@ -2164,5 +2240,399 @@ mod tests {
         assert_eq!(export_stem(0, "page-a"), "0001_page-a");
         assert_eq!(export_stem(1, "  weird:name.png "), "0002_weird_name");
         assert_eq!(export_stem(2, "..."), "0003_page");
+    }
+
+    // --- MCP tools (the /mcp transport over the same service core) ---
+
+    fn tools_with(runner: Runner) -> KoharuTools {
+        KoharuTools::new(state_with(runner))
+    }
+
+    fn structured(result: Result<CallToolResult, rmcp::ErrorData>) -> Value {
+        let result = result.expect("tool layer returned a protocol error");
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "unexpected tool error: {result:?}"
+        );
+        result
+            .structured_content
+            .expect("tool result carries structured content")
+    }
+
+    fn tool_error(result: Result<CallToolResult, rmcp::ErrorData>) -> String {
+        let result = result.expect("tool layer returned a protocol error");
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "unexpected tool success: {result:?}"
+        );
+        let content = serde_json::to_value(&result.content).unwrap();
+        content[0]["text"]
+            .as_str()
+            .expect("error result carries text content")
+            .to_owned()
+    }
+
+    fn entity_id(value: &str) -> EntityId {
+        serde_json::from_value(Value::String(value.to_owned())).unwrap()
+    }
+
+    async fn tools_open_with_pages(tools: &KoharuTools, root: &Path) -> Vec<String> {
+        structured(
+            tools
+                .open_project(Parameters(OpenProjectRequest {
+                    path: root.join("project").display().to_string(),
+                    create: Some(true),
+                }))
+                .await,
+        );
+        let first = write_png(root, "page-a.png", 3, 4);
+        let second = write_png(root, "page-b.png", 8, 2);
+        let response = structured(
+            tools
+                .add_pages(Parameters(AddPagesRequest {
+                    paths: vec![first.display().to_string(), second.display().to_string()],
+                    index: None,
+                }))
+                .await,
+        );
+        response["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|page| page["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    async fn wait_status_tools(tools: &KoharuTools, id: &str, expected: &str) -> Value {
+        for _ in 0..400 {
+            let operations = structured(tools.list_operations().await);
+            if let Some(entry) = operations["operations"]
+                .as_array()
+                .and_then(|entries| entries.iter().find(|entry| entry["id"] == id))
+                .cloned()
+                && entry["status"] == expected
+            {
+                return entry;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("operation {id} never reached status {expected}");
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_return_the_same_payloads_as_http() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state_with(Runner::execute());
+        let app = router(Arc::clone(&state), Ipv4Addr::LOCALHOST.into());
+        let tools = KoharuTools::new(Arc::clone(&state));
+
+        let request = json!({
+            "path": root.path().join("project").display().to_string(),
+            "create": true,
+        });
+        let (status, http_body) = send(&app, post_json("/api/v1/project/open", request)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let tool_body = structured(
+            tools
+                .open_project(Parameters(OpenProjectRequest {
+                    path: root.path().join("project").display().to_string(),
+                    create: None,
+                }))
+                .await,
+        );
+        assert_eq!(http_body, tool_body);
+
+        let first = write_png(root.path(), "page-a.png", 3, 4);
+        let second = write_png(root.path(), "page-b.png", 8, 2);
+        let (_, http_body) = send(
+            &app,
+            post_json(
+                "/api/v1/project/pages",
+                json!({"paths": [first.display().to_string()]}),
+            ),
+        )
+        .await;
+        let tool_body = structured(
+            tools
+                .add_pages(Parameters(AddPagesRequest {
+                    paths: vec![second.display().to_string()],
+                    index: None,
+                }))
+                .await,
+        );
+        let http_page = &http_body["pages"][0];
+        let tool_page = &tool_body["pages"][0];
+        assert_eq!(
+            http_page.as_object().unwrap().keys().collect::<Vec<_>>(),
+            tool_page.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(tool_page["index"], 1);
+        assert_eq!(tool_page["width"], 8.0);
+    }
+
+    #[tokio::test]
+    async fn mcp_open_project_rejects_a_relative_path() {
+        let tools = tools_with(Runner::execute());
+
+        let error = tool_error(
+            tools
+                .open_project(Parameters(OpenProjectRequest {
+                    path: "relative/project".to_owned(),
+                    create: None,
+                }))
+                .await,
+        );
+        assert_eq!(error, "400: project path must be absolute");
+    }
+
+    #[tokio::test]
+    async fn mcp_add_pages_without_a_project_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let page = write_png(root.path(), "page-a.png", 3, 4);
+        let tools = tools_with(Runner::execute());
+
+        let error = tool_error(
+            tools
+                .add_pages(Parameters(AddPagesRequest {
+                    paths: vec![page.display().to_string()],
+                    index: None,
+                }))
+                .await,
+        );
+        assert_eq!(error, "404: no project is open");
+    }
+
+    #[tokio::test]
+    async fn mcp_add_pages_rejects_empty_paths() {
+        let tools = tools_with(Runner::execute());
+
+        let error = tool_error(
+            tools
+                .add_pages(Parameters(AddPagesRequest {
+                    paths: Vec::new(),
+                    index: None,
+                }))
+                .await,
+        );
+        assert_eq!(error, "400: paths must not be empty");
+    }
+
+    #[tokio::test]
+    async fn mcp_start_pipeline_completes_and_lists_the_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tools_with(completing_runner());
+        tools_open_with_pages(&tools, root.path()).await;
+
+        let response = structured(
+            tools
+                .start_pipeline(Parameters(StartPipelineRequest {
+                    stages: vec![Stage::Ocr],
+                    pages: None,
+                    target_language: None,
+                    system_prompt: None,
+                }))
+                .await,
+        );
+        let id = response["operationId"].as_str().unwrap().to_owned();
+        let entry = wait_status_tools(&tools, &id, "completed").await;
+        assert_eq!(entry["completed"], 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_start_pipeline_conflicts_while_active_and_stops() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tools_with(stopping_runner());
+        tools_open_with_pages(&tools, root.path()).await;
+
+        let response = structured(
+            tools
+                .start_pipeline(Parameters(StartPipelineRequest {
+                    stages: Vec::new(),
+                    pages: None,
+                    target_language: None,
+                    system_prompt: None,
+                }))
+                .await,
+        );
+        let id = response["operationId"].as_str().unwrap().to_owned();
+
+        let error = tool_error(
+            tools
+                .start_pipeline(Parameters(StartPipelineRequest {
+                    stages: Vec::new(),
+                    pages: None,
+                    target_language: None,
+                    system_prompt: None,
+                }))
+                .await,
+        );
+        assert_eq!(error, "409: a pipeline run is already active");
+
+        let response = structured(
+            tools
+                .stop_operation(Parameters(super::mcp::StopOperationRequest {
+                    id: id.clone(),
+                }))
+                .await,
+        );
+        assert_eq!(response["operationId"], id.as_str());
+        wait_status_tools(&tools, &id, "stopped").await;
+    }
+
+    #[tokio::test]
+    async fn mcp_start_pipeline_rejects_empty_pages() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tools_with(completing_runner());
+        tools_open_with_pages(&tools, root.path()).await;
+
+        let error = tool_error(
+            tools
+                .start_pipeline(Parameters(StartPipelineRequest {
+                    stages: Vec::new(),
+                    pages: Some(Vec::new()),
+                    target_language: None,
+                    system_prompt: None,
+                }))
+                .await,
+        );
+        assert_eq!(error, "400: pages must not be empty");
+    }
+
+    #[tokio::test]
+    async fn mcp_export_pages_writes_rendered_files() {
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let tools = tools_with(Runner::execute());
+        tools_open_with_pages(&tools, root.path()).await;
+
+        let response = structured(
+            tools
+                .export_pages(Parameters(ExportRequest {
+                    pages: None,
+                    dir: Some(out.path().display().to_string()),
+                    format: None,
+                }))
+                .await,
+        );
+        let files = response["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        let path = Path::new(files[0].as_str().unwrap());
+        assert_eq!(png_dimensions(path), (3, 4));
+    }
+
+    #[tokio::test]
+    async fn mcp_export_rejects_an_unknown_page_id() {
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let tools = tools_with(Runner::execute());
+        tools_open_with_pages(&tools, root.path()).await;
+
+        let error = tool_error(
+            tools
+                .export_pages(Parameters(ExportRequest {
+                    pages: Some(vec![entity_id("00000000-0000-0000-0000-000000000000")]),
+                    dir: Some(out.path().display().to_string()),
+                    format: None,
+                }))
+                .await,
+        );
+        assert_eq!(
+            error,
+            "404: page not found: 00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_export_without_a_project_is_an_error() {
+        let out = tempfile::tempdir().unwrap();
+        let tools = tools_with(Runner::execute());
+
+        let error = tool_error(
+            tools
+                .export_pages(Parameters(ExportRequest {
+                    pages: None,
+                    dir: Some(out.path().display().to_string()),
+                    format: None,
+                }))
+                .await,
+        );
+        assert_eq!(error, "404: no project is open");
+    }
+
+    fn mcp_request(body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mcp_transport_serves_initialize_and_the_tool_catalog() {
+        let app = app();
+
+        let response = app
+            .clone()
+            .oneshot(mcp_request(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0"}
+                }
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["result"]["serverInfo"]["name"], "koharu-rpc");
+        assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+
+        let response = app
+            .clone()
+            .oneshot(mcp_request(
+                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(mcp_request(
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let mut names: Vec<&str> = body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "koharu.add_pages",
+                "koharu.export_pages",
+                "koharu.list_operations",
+                "koharu.open_project",
+                "koharu.start_pipeline",
+                "koharu.stop_operation"
+            ]
+        );
     }
 }
