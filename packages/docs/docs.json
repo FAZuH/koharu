@@ -134,6 +134,7 @@
               "en/reference/settings",
               "en/reference/shortcuts",
               "en/reference/data",
+              "en/reference/rpc-api",
               "en/reference/troubleshooting"
             ]
           }

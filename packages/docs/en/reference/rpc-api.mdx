@@ -1,0 +1,218 @@
+---
+title: 'HTTP and MCP server'
+description: 'Run Koharu pipelines from scripts with the headless koharu-rpc server, its JSON HTTP API, and its MCP endpoint.'
+icon: 'server'
+---
+
+`koharu-rpc` is a separate headless binary. It runs the same pipelines as the desktop app, with no window. Use it from scripts and from agent clients.
+
+One process serves two interfaces on one port:
+
+- A JSON HTTP API under `/api/v1`.
+- An MCP endpoint at `/mcp`.
+
+Both use the same state in the process: one open project, and the pipeline runs of that process. The desktop app is unaffected. The desktop webview never uses this server; it keeps Tauri channels.
+
+## Run the server
+
+```bash
+cargo build -p koharu-rpc
+./target/debug/koharu-rpc
+```
+
+| Flag      | Default     | Purpose                                                         |
+| --------- | ----------- | --------------------------------------------------------------- |
+| `--host`  | `127.0.0.1` | Bind address. Use an address of this machine.                   |
+| `--port`  | `4100`      | TCP port. The server stops with an error if the port is busy.    |
+| `--cpu`   | off         | Use the CPU device instead of the detected GPU.                  |
+| `--debug` | off         | Print server log output.                                         |
+
+Check that the server answers:
+
+```bash
+curl http://127.0.0.1:4100/api/v1/health
+```
+
+<Note>
+  The server binds the port, then loads the native runtime before it answers its first
+  request. On a machine that never ran Koharu, that step downloads the runtime and takes
+  minutes. Model weights download later, the first time a stage uses them. The first pipeline
+  run is therefore slower than later runs. To fetch the runtime and the weights once in
+  advance, run the headless pipeline binary on one page:
+  `cargo run -p koharu-pipeline --bin run -- --input page.png --output out.png`.
+</Note>
+
+## Script flow
+
+This flow uses `jq` and the default port. All paths must be absolute.
+
+```bash
+BASE=http://127.0.0.1:4100/api/v1
+```
+
+<Steps>
+  <Step title='Check the server'>
+    ```bash
+    curl -fsS $BASE/health
+    ```
+  </Step>
+  <Step title='Open or create a project'>
+    ```bash
+    curl -fsS -X POST $BASE/project/open \
+      -H 'content-type: application/json' \
+      -d '{"path": "/work/comic/chapter-1.khrproj", "create": true}'
+    ```
+  </Step>
+  <Step title='Add page images'>
+    Koharu copies PNG, JPEG, or WebP files into the project.
+    ```bash
+    curl -fsS -X POST $BASE/project/pages \
+      -H 'content-type: application/json' \
+      -d '{"paths": ["/work/in/p01.png", "/work/in/p02.png"]}'
+    ```
+  </Step>
+  <Step title='Start a pipeline run'>
+    ```bash
+    ID=$(curl -fsS -X POST $BASE/pipelines \
+      -H 'content-type: application/json' \
+      -d '{"stages": ["ocr", "translation"]}' | jq -r .operationId)
+    ```
+  </Step>
+  <Step title='Poll until the run finishes'>
+    Progress is polled, not streamed. There is no SSE or WebSocket endpoint in this version.
+    ```bash
+    while :; do
+      S=$(curl -fsS $BASE/operations \
+        | jq -r --arg id "$ID" '.[] | select(.id == $id) | .status')
+      case $S in running) sleep 2 ;; *) break ;; esac
+    done
+    echo "$S"
+    ```
+  </Step>
+  <Step title='Export the rendered pages'>
+    ```bash
+    curl -fsS -X POST $BASE/export \
+      -H 'content-type: application/json' \
+      -d '{"dir": "/work/out", "format": "png"}'
+    ```
+  </Step>
+</Steps>
+
+One pipeline run is allowed at a time. A second start request returns `409`. Only `completed`
+is a successful status; `stopped` and `failed` end the run early. To cancel a run, call
+`curl -X DELETE $BASE/operations/$ID`.
+
+A complete copy of this flow ships in the repository at `scripts/e2e-rpc-demo.sh`. It is a
+manual script, and it needs the weights.
+
+## HTTP reference
+
+| Method   | Path                          | Purpose                                    | Response                                              |
+| -------- | ----------------------------- | ------------------------------------------ | ----------------------------------------------------- |
+| `GET`    | `/api/v1/health`              | Report that the server answers             | `{"status": "ok", "version": "<package version>"}`     |
+| `GET`    | `/api/v1/project`             | Describe the open project                  | project object, or `404` when none is open            |
+| `POST`   | `/api/v1/project/open`        | Open an existing project, or create one    | project object                                        |
+| `POST`   | `/api/v1/project/pages`       | Add image files as pages                   | `{"pages": [page, …]}` — the added pages only          |
+| `POST`   | `/api/v1/pipelines`           | Start a pipeline run                       | `202` `{"operationId": "<id>"}`                       |
+| `GET`    | `/api/v1/operations`          | List the runs of this process              | array of operation objects                            |
+| `DELETE` | `/api/v1/operations/{id}`     | Ask a run to stop                          | `204`, no body                                        |
+| `GET`    | `/api/v1/pages/{id}/image`    | Return the stored source image of a page   | image bytes with their content type                   |
+| `POST`   | `/api/v1/export`              | Render pages and write files to disk       | `{"files": ["<absolute path>", …]}`                    |
+
+A project object is `{"name", "path", "pages": [page, …]}`. A page object is
+`{"id", "index", "width", "height"}`. An operation object is
+`{"id", "status", "completed", "total", "elapsed", "recentProgress"}`, plus `"message"` only
+when the run failed. `status` is `running`, `completed`, `stopped`, or `failed`. `elapsed` is
+in seconds. `recentProgress` holds the last 32 events of that run, each tagged with an `event`
+field of `started`, `loading`, `running`, `finished`, or `skipped`.
+
+### Request bodies
+
+All keys are camelCase.
+
+| Route                    | Fields                                                                                             |
+| ------------------------ | -------------------------------------------------------------------------------------------------- |
+| `/api/v1/project/open`   | `path` (absolute), `create` (boolean, default `false`)                                              |
+| `/api/v1/project/pages`  | `paths` (absolute image paths, at least one), `index` (insert before this index; default append)    |
+| `/api/v1/pipelines`      | `stages`, `pages` (page ids; default the whole project), `targetLanguage`, `systemPrompt`           |
+| `/api/v1/export`         | `pages` (page ids; default every page), `dir` (absolute), `format` (`png` default, or `psd`)        |
+
+`stages` accepts `detection`, `ocr`, `translation`, and `inpainting`. An empty list runs all of
+them, in pipeline order. `targetLanguage` accepts a tag such as `en`, `ja`, or `zh-CN`. A run
+uses your saved Koharu settings, and `targetLanguage` or `systemPrompt` override them for that
+run only.
+
+### Errors
+
+Every failure returns the JSON envelope `{"status": <integer>, "message": "<text>"}`, with the
+same integer as the HTTP status.
+
+| Status | Cause                                                                     |
+| ------ | ------------------------------------------------------------------------- |
+| `400`  | A relative path, an empty `paths` or `pages` list, or an unusable export path |
+| `404`  | No project is open, a page or file is missing, or no route matches the path |
+| `409`  | A pipeline run is active: a second start, or a project or page change       |
+| `422`  | An unreadable image, or project data Koharu cannot parse                    |
+| `500`  | The server could not build a pipeline, or the render engine failed          |
+
+A stage that fails inside a run is not an HTTP error. The start call already returned `202`.
+That run ends with operation status `failed` and a `message` that explains the failure.
+
+`POST /api/v1/export` is allowed during a run. The result can be a partial render. Opening a
+project or adding pages is not allowed during a run.
+
+## MCP tools
+
+The `/mcp` endpoint exposes six tools over the same operations. Arguments use the same
+camelCase names as the HTTP bodies.
+
+| Tool                    | Arguments                                                | Structured result              |
+| ----------------------- | -------------------------------------------------------- | ------------------------------ |
+| `koharu.open_project`   | `path`, `create`                                          | project object                 |
+| `koharu.add_pages`      | `paths`, `index`                                          | `{"pages": [page, …]}`         |
+| `koharu.start_pipeline` | `stages`, `pages`, `targetLanguage`, `systemPrompt`       | `{"operationId": "<id>"}`      |
+| `koharu.list_operations`| none                                                      | `{"operations": [operation, …]}` |
+| `koharu.stop_operation` | `id`                                                      | `{"operationId": "<id>"}`      |
+| `koharu.export_pages`   | `pages`, `dir`, `format`                                  | `{"files": ["<path>", …]}`     |
+
+Two results differ from the HTTP shapes:
+
+- `koharu.list_operations` returns an object with one `operations` key, because MCP structured
+  content must be an object. The HTTP route returns a bare array.
+- `koharu.stop_operation` returns `{"operationId": "<id>"}`. The HTTP route returns `204` with
+  no body.
+
+A failed operation comes back as a tool error (`isError`) whose text is
+`<status>: <message>`, for example `409: a pipeline run is already active`. It is not a
+JSON-RPC protocol error.
+
+## Connect an MCP client
+
+Start the server, then point the client at the endpoint:
+
+```json
+{
+  "mcpServers": {
+    "koharu": {
+      "url": "http://127.0.0.1:4100/mcp"
+    }
+  }
+}
+```
+
+The endpoint speaks streamable HTTP and answers request/response calls with plain JSON. It is
+not a stdio subprocess, so `command` and `args` entries do not apply. Some clients also want a
+transport key, such as `"type": "http"`; check your client's own documentation for the exact
+name. A client that supports only stdio needs a bridge process that forwards to the URL.
+
+## Security
+
+<Warning>
+  The server has no authentication. Anyone who can reach the port controls Koharu and can write
+  files.
+</Warning>
+
+- Bind to loopback and keep the server on your own machine. `--host` defaults to `127.0.0.1`. The server prints a startup warning when `--host` is not a loopback address.
+- `POST /api/v1/export` writes to any absolute path the server process can write, and it creates the directory. The default is `<project>/exports`. That default is not saved into the project; the server recomputes it per request.
+- The `/mcp` endpoint rejects a request whose `Host` header is not `localhost`, `127.0.0.1`, or `::1`. When you bind to one specific address, that address is accepted too. This blocks DNS rebinding from a browser. The `/api/v1` routes have no such check. Treat that as a known gap if you expose the port.
+- Any local user or process that can reach the port can open projects and write files. Run the server as a user who has only the access the work needs.
