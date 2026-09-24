@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use indoc::indoc;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Value, json};
@@ -28,13 +28,24 @@ pub(crate) fn translations(
     text: &str,
     source_segments: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    let output = serde_json::from_str::<TranslationOutput>(text).with_context(|| {
-        format!(
-            "{provider} returned invalid translation JSON for {} segments; response was: {}",
-            source_segments.len(),
-            snippet(text),
-        )
-    })?;
+    let output = serde_json::Deserializer::from_str(text)
+        .into_iter::<TranslationOutput>()
+        .next()
+        .transpose()
+        .with_context(|| {
+            format!(
+                "{provider} returned invalid translation JSON for {} segments; response was: {}",
+                source_segments.len(),
+                snippet(text),
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "{provider} returned no translation JSON for {} segments; response was: {}",
+                source_segments.len(),
+                snippet(text),
+            )
+        })?;
     let mut translations = source_segments.to_vec();
     let mut translated = vec![false; source_segments.len()];
 
@@ -252,6 +263,17 @@ mod tests {
             translations("test", response, &source).unwrap(),
             ["hello", "world"]
         );
+    }
+
+    #[test]
+    fn parses_json_before_reasoning() {
+        let source = ["one".to_owned()];
+        let response = concat!(
+            r#"{"translations":[{"id":0,"text":"hello"}]}"#,
+            "\n\nI will use this translation."
+        );
+
+        assert_eq!(translations("test", response, &source).unwrap(), ["hello"]);
     }
 
     #[test]

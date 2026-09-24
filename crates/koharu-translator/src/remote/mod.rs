@@ -172,7 +172,9 @@ pub(super) async fn send_json<T: DeserializeOwned>(
         });
     }
 
-    serde_json::from_str(&text)
+    let body = text.trim_end();
+    let body = body.strip_suffix("data: [DONE]").unwrap_or(body).trim_end();
+    serde_json::from_str(body)
         .with_context(|| format!("failed to decode {provider} response"))
         .map_err(Into::into)
 }
