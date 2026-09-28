@@ -317,7 +317,11 @@ impl Operations {
             }
             Err(error) => {
                 job.status = JobStatus::Failed;
-                job.message = Some(error.to_string());
+                // The alternate form keeps the whole chain. A stage collapses
+                // its own message to the provider name, so the provider's own
+                // diagnosis — a command's exit status and stderr — survives only
+                // in the sources printed here.
+                job.message = Some(format!("{error:#}"));
                 job.elapsed = Some(job.started.elapsed());
             }
         }
@@ -373,10 +377,19 @@ struct ServerState {
     overridden: StdMutex<Option<(OverrideKey, Pipeline)>>,
     export: OnceCell<ExportEngine>,
     runner: Runner,
+    /// Rendezvous for the command translation provider: the MCP tool that
+    /// accepts a chunk and the pipeline stage that is waiting for it share
+    /// this one slot map, which is what makes the callback possible at all.
+    submissions: koharu_translator::ChunkSubmissions,
 }
 
 impl ServerState {
-    fn new(pipeline: Pipeline, device: Device, runner: Runner) -> Self {
+    fn new(
+        pipeline: Pipeline,
+        device: Device,
+        runner: Runner,
+        submissions: koharu_translator::ChunkSubmissions,
+    ) -> Self {
         Self {
             project: Arc::default(),
             operations: Operations::default(),
@@ -385,6 +398,7 @@ impl ServerState {
             overridden: StdMutex::new(None),
             export: OnceCell::new(),
             runner,
+            submissions,
         }
     }
 
@@ -421,6 +435,7 @@ impl ServerState {
             Config::memory(config),
             ProvidersConfig::load()?,
             self.device.clone(),
+            Some(self.submissions.clone()),
         )?;
         *self
             .overridden
@@ -454,7 +469,10 @@ async fn main() -> Result<()> {
     eprintln!("warming the native runtime; the first run can take several minutes");
     koharu_ml::init().await?;
     let device = koharu_ml::device(arguments.cpu);
-    let pipeline = Pipeline::load(device.clone())?;
+    // One channel serves both the pipeline that runs the work and the MCP tool
+    // that answers it, so it is created here rather than inside either half.
+    let submissions = koharu_translator::ChunkSubmissions::default();
+    let pipeline = Pipeline::load(device.clone(), Some(submissions.clone()))?;
 
     println!(
         "koharu-rpc listening on http://{}:{}",
@@ -464,7 +482,12 @@ async fn main() -> Result<()> {
     axum::serve(
         listener,
         router(
-            Arc::new(ServerState::new(pipeline, device, Runner::execute())),
+            Arc::new(ServerState::new(
+                pipeline,
+                device,
+                Runner::execute(),
+                submissions,
+            )),
             arguments.host,
         ),
     )
@@ -1289,12 +1312,18 @@ mod tests {
             Config::memory(PipelineConfig::default()),
             Config::memory(ProvidersConfig::default()),
             Device::cpu(),
+            None,
         )
         .expect("a memory-config pipeline needs no weights")
     }
 
     fn state_with(runner: Runner) -> super::AppState {
-        Arc::new(ServerState::new(test_pipeline(), Device::cpu(), runner))
+        Arc::new(ServerState::new(
+            test_pipeline(),
+            Device::cpu(),
+            runner,
+            koharu_translator::ChunkSubmissions::default(),
+        ))
     }
 
     fn app_with(runner: Runner) -> App {
@@ -2545,6 +2574,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_submit_translations_rejects_a_chunk_that_is_not_waiting() {
+        let tools = tools_with(Runner::execute());
+
+        let error = tool_error(
+            tools
+                .submit_translations(Parameters(super::mcp::SubmitTranslationsRequest {
+                    chunk_id: 7,
+                    translations: vec![super::mcp::SubmittedTranslation {
+                        id: 0,
+                        text: "hello".to_owned(),
+                    }],
+                }))
+                .await,
+        );
+
+        assert_eq!(error, "chunk 7 is not waiting for a translation");
+    }
+
+    #[tokio::test]
     async fn mcp_export_without_a_project_is_an_error() {
         let out = tempfile::tempdir().unwrap();
         let tools = tools_with(Runner::execute());
@@ -2631,7 +2679,8 @@ mod tests {
                 "koharu.list_operations",
                 "koharu.open_project",
                 "koharu.start_pipeline",
-                "koharu.stop_operation"
+                "koharu.stop_operation",
+                "koharu.submit_translations"
             ]
         );
     }

@@ -60,7 +60,9 @@ impl ProviderPreferences {
             .into_iter()
             .map(|config| {
                 let provider = config.provider();
-                let credential = if provider == Provider::Local {
+                let credential = if matches!(provider, Provider::Local | Provider::Command) {
+                    // The command provider authenticates however its own
+                    // harness does, so there is no key to collect here.
                     None
                 } else {
                     let key: &'static str = provider.into();

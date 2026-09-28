@@ -180,6 +180,7 @@ async fn main() -> Result<()> {
         Config::memory(arguments.pipeline_config()),
         Config::memory(ProvidersConfig::default()),
         device,
+        None,
     )?;
     let snapshot = session.snapshot();
     let mut committer = SessionCommitter(&mut session);

@@ -1,6 +1,7 @@
 //! Translation through local and hosted providers.
 
 mod backend;
+mod command;
 mod error;
 mod language;
 mod local;
@@ -8,6 +9,7 @@ mod model;
 mod prompt;
 mod provider;
 mod remote;
+mod submissions;
 
 use std::{sync::Arc, time::Duration};
 
@@ -21,6 +23,7 @@ pub use language::Language;
 pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
 pub use provider::{Provider, ProviderConfig, ProvidersConfig};
+pub use submissions::{ChunkSubmissions, SubmitError};
 
 #[derive(Clone)]
 pub struct Translator {
@@ -28,6 +31,10 @@ pub struct Translator {
     local: Arc<tokio::sync::Mutex<Option<LoadedLocal>>>,
     client: reqwest::Client,
     device: Device,
+    /// Present only for the server transport, which is what lets a translation
+    /// command call back in. A headless pipeline run has no submission channel
+    /// and therefore cannot use the command provider.
+    submissions: Option<ChunkSubmissions>,
 }
 
 struct LoadedLocal {
@@ -46,12 +53,14 @@ impl Translator {
     pub fn from_config(
         device: Device,
         providers: koharu_config::Config<ProvidersConfig>,
+        submissions: Option<ChunkSubmissions>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             providers,
             local: Arc::new(tokio::sync::Mutex::new(None)),
             client: koharu_runtime::http_client()?,
             device,
+            submissions,
         })
     }
 
@@ -62,7 +71,10 @@ impl Translator {
 
     #[must_use]
     pub fn supports_vision(selection: &ModelSelection, generation: &GenerationConfig) -> bool {
+        // The command provider is handed text through argv, so decoding and
+        // resizing the page image would be paid for and thrown away.
         generation.vision.unwrap_or(false)
+            && selection.provider != Provider::Command
             && (selection.provider != Provider::Local || local::supports_vision(selection))
     }
 
@@ -142,6 +154,9 @@ impl Translator {
                 .await?
                 .translate(request, generation)
                 .await?
+        } else if provider == Provider::Command {
+            let providers = self.providers.read()?.clone();
+            command::translate(&providers.command, self.submissions.as_ref(), &request).await?
         } else {
             let providers = self.providers.read()?.clone();
             remote::translate(&self.client, &providers, selection, &generation, &request).await?

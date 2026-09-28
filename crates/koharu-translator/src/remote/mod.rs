@@ -89,6 +89,7 @@ pub(crate) async fn translate(
         }
         Provider::Caiyun => caiyun::translate(client, &providers.caiyun, request).await,
         Provider::Local => unreachable!("local translation has its own backend"),
+        Provider::Command => unreachable!("command translation is not an HTTP backend"),
     }
 }
 

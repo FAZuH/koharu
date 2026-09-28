@@ -96,6 +96,7 @@ fn pipeline(translation: TranslationConfig) -> Pipeline {
         koharu_config::Config::memory(config),
         koharu_config::Config::memory(koharu_translator::ProvidersConfig::default()),
         koharu_ml::Device::cpu(),
+        None,
     )
     .unwrap()
 }

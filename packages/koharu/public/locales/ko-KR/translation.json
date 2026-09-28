@@ -321,6 +321,7 @@
   "providerDescriptions": {
     "caiyun": "Caiyun 번역 API입니다.",
     "claude": "Anthropic Claude 모델입니다.",
+    "command": "직접 실행하는 명령줄 도구를 통한 번역입니다.",
     "deepl": "DeepL 번역 API입니다.",
     "deepseek": "DeepSeek 언어 모델입니다.",
     "gemini": "Google Gemini 모델입니다.",

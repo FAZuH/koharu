@@ -31,7 +31,7 @@ pub(crate) async fn initialize(handle: AppHandle<CefRuntime>) -> Result<()> {
         "gpu_model": device.description.clone(),
         "vram_bytes": device.memory_total,
     }));
-    let pipeline = koharu_pipeline::Pipeline::load(device)?;
+    let pipeline = koharu_pipeline::Pipeline::load(device, None)?;
     handle.manage(pipeline.clone());
 
     let mut resources = pipeline.subscribe_resources();

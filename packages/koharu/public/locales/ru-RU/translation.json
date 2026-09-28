@@ -321,6 +321,7 @@
   "providerDescriptions": {
     "caiyun": "API перевода Caiyun.",
     "claude": "Модели Anthropic Claude.",
+    "command": "Переводы с помощью собственного инструмента командной строки.",
     "deepl": "API перевода DeepL.",
     "deepseek": "Языковые модели DeepSeek.",
     "gemini": "Модели Google Gemini.",

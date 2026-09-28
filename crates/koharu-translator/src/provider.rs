@@ -4,6 +4,7 @@ use specta::Type;
 use strum::{Display, EnumIter, EnumString, IntoStaticStr, VariantArray};
 
 use crate::{
+    command::CommandConfig,
     local::LocalConfig,
     remote::{
         CaiyunConfig, ClaudeConfig, DeepLConfig, DeepSeekConfig, GeminiConfig, GoogleCloudConfig,
@@ -162,6 +163,12 @@ define_providers! {
         name: "OpenAI-compatible",
         field: openai_compatible,
         config: OpenAiCompatibleConfig,
+    }
+    Command {
+        id: "command",
+        name: "Command",
+        field: command,
+        config: CommandConfig,
     }
     OpenRouter {
         id: "openrouter",

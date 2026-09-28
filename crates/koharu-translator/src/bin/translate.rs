@@ -77,8 +77,10 @@ async fn main() -> Result<()> {
     {
         anyhow::bail!("--model is required for {provider}");
     }
+    // Nothing can answer the command provider here: the callback only exists
+    // in the server transport, so pass no channel and let it fail fast.
     let translator =
-        Translator::from_config(koharu_ml::device(args.cpu), Config::memory(providers))?;
+        Translator::from_config(koharu_ml::device(args.cpu), Config::memory(providers), None)?;
     let selection = ModelSelection {
         provider,
         model,
@@ -120,6 +122,8 @@ fn prepare_secret(args: &Args, provider: Provider) -> Result<()> {
         Provider::DeepL => Some(("DEEPL_API_KEY", true)),
         Provider::GoogleCloudTranslation => Some(("GOOGLE_CLOUD_API_KEY", true)),
         Provider::Caiyun => Some(("CAIYUN_API_KEY", true)),
+        // The command authenticates however it likes; this tool has no key.
+        Provider::Command => None,
     }) else {
         return Ok(());
     };

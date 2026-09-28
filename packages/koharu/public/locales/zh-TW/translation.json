@@ -321,6 +321,7 @@
   "providerDescriptions": {
     "caiyun": "Caiyun 翻譯 API。",
     "claude": "Anthropic Claude 模型。",
+    "command": "透過自有命令列工具進行的翻譯。",
     "deepl": "DeepL 翻譯 API。",
     "deepseek": "DeepSeek 語言模型。",
     "gemini": "Google Gemini 模型。",

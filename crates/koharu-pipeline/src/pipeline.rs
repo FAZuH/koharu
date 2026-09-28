@@ -18,11 +18,15 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn load(device: koharu_ml::Device) -> Result<Self> {
+    pub fn load(
+        device: koharu_ml::Device,
+        submissions: Option<koharu_translator::ChunkSubmissions>,
+    ) -> Result<Self> {
         Self::from_config(
             PipelineConfig::load()?,
             koharu_translator::ProvidersConfig::load()?,
             device,
+            submissions,
         )
     }
 
@@ -31,8 +35,10 @@ impl Pipeline {
         config: Config<PipelineConfig>,
         providers: Config<koharu_translator::ProvidersConfig>,
         device: koharu_ml::Device,
+        submissions: Option<koharu_translator::ChunkSubmissions>,
     ) -> Result<Self> {
-        let translator = koharu_translator::Translator::from_config(device.clone(), providers)?;
+        let translator =
+            koharu_translator::Translator::from_config(device.clone(), providers, submissions)?;
         let resources = ResourceMonitor::new(&device);
         let runner = {
             let value = config.read()?;

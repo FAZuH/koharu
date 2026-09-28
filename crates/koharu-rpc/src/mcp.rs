@@ -1,5 +1,5 @@
-//! MCP transport: the six service-core operations exposed as MCP tools over
-//! the streamable HTTP transport at `/mcp`, sharing the same functions the
+//! MCP transport: the service-core operations exposed as MCP tools over the
+//! streamable HTTP transport at `/mcp`, sharing the same functions the
 //! HTTP handlers call.
 
 use std::{net::IpAddr, sync::Arc};
@@ -135,6 +135,53 @@ impl KoharuTools {
             Err(error) => Ok(Self::failure(error)),
         }
     }
+
+    #[tool(
+        name = "koharu.submit_translations",
+        description = "Answer a translation chunk. This is the only way to return a translation: pass the chunkId it was given and one entry per source segment, copying each id exactly once"
+    )]
+    pub(crate) async fn submit_translations(
+        &self,
+        Parameters(request): Parameters<SubmitTranslationsRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let translations = request
+            .translations
+            .into_iter()
+            .map(|entry| (entry.id, entry.text))
+            .collect();
+        match self
+            .state
+            .submissions
+            .submit(request.chunk_id, translations)
+        {
+            Ok(accepted) => Ok(CallToolResult::structured(rmcp::serde_json::json!({
+                "chunkId": request.chunk_id,
+                "accepted": accepted,
+            }))),
+            // A rejected submission is a tool-level error so the caller can
+            // correct itself and call again; only a consumed chunk is final.
+            Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                error.to_string(),
+            )])),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SubmitTranslationsRequest {
+    #[schemars(description = "the chunkId the command was given in {{id}}")]
+    pub(crate) chunk_id: u64,
+    #[schemars(description = "one entry per source segment, copying each id exactly once")]
+    pub(crate) translations: Vec<SubmittedTranslation>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct SubmittedTranslation {
+    #[schemars(description = "the source segment id from {{text}}")]
+    pub(crate) id: usize,
+    #[schemars(description = "the translated text, which must not be empty")]
+    pub(crate) text: String,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]

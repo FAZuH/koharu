@@ -134,6 +134,27 @@ export type CodexModel = {
 	reasoning: Reasoning[],
 };
 
+export type CommandConfig = {
+	/**
+	 *  Argument vector, with `{{id}}` and `{{text}}` substituted per chunk.
+	 *  Rendered without a shell, so a placeholder may expand to text
+	 *  containing quotes or newlines without changing the command.
+	 */
+	argv?: string[],
+	/**
+	 *  Working directory for the command, which is also where a project-scoped
+	 *  agent configuration such as the MCP server registration is resolved.
+	 */
+	cwd?: string | null,
+	/**  Budget for one chunk, covering both the process and its submission. */
+	timeout_secs?: number,
+	/**
+	 *  Segments per chunk. Larger chunks mean fewer processes but a single bad
+	 *  page loses the whole chunk.
+	 */
+	segments_per_chunk?: number,
+};
+
 export type Config = {
 	model: string | null,
 	reasoning: Reasoning,
@@ -423,9 +444,9 @@ export type ProjectSummary = {
 	name: string,
 };
 
-export type Provider = "local" | "openai" | "gemini" | "claude" | "grok" | "minimax" | "deepseek" | "openai-compatible" | "openrouter" | "lm-studio" | "deepl" | "google-cloud-translation" | "caiyun";
+export type Provider = "local" | "openai" | "gemini" | "claude" | "grok" | "minimax" | "deepseek" | "openai-compatible" | "command" | "openrouter" | "lm-studio" | "deepl" | "google-cloud-translation" | "caiyun";
 
-export type ProviderConfig = { provider: "local"; settings: LocalConfig } | { provider: "openai"; settings: OpenAiConfig } | { provider: "gemini"; settings: GeminiConfig } | { provider: "claude"; settings: ClaudeConfig } | { provider: "grok"; settings: GrokConfig } | { provider: "minimax"; settings: MiniMaxConfig } | { provider: "deepseek"; settings: DeepSeekConfig } | { provider: "openai-compatible"; settings: OpenAiCompatibleConfig } | { provider: "openrouter"; settings: OpenRouterConfig } | { provider: "lm-studio"; settings: LmStudioConfig } | { provider: "deepl"; settings: DeepLConfig } | { provider: "google-cloud-translation"; settings: GoogleCloudConfig } | { provider: "caiyun"; settings: CaiyunConfig };
+export type ProviderConfig = { provider: "local"; settings: LocalConfig } | { provider: "openai"; settings: OpenAiConfig } | { provider: "gemini"; settings: GeminiConfig } | { provider: "claude"; settings: ClaudeConfig } | { provider: "grok"; settings: GrokConfig } | { provider: "minimax"; settings: MiniMaxConfig } | { provider: "deepseek"; settings: DeepSeekConfig } | { provider: "openai-compatible"; settings: OpenAiCompatibleConfig } | { provider: "command"; settings: CommandConfig } | { provider: "openrouter"; settings: OpenRouterConfig } | { provider: "lm-studio"; settings: LmStudioConfig } | { provider: "deepl"; settings: DeepLConfig } | { provider: "google-cloud-translation"; settings: GoogleCloudConfig } | { provider: "caiyun"; settings: CaiyunConfig };
 
 export type ProviderPreference = {
 	name: string,

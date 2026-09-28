@@ -123,6 +123,18 @@ pub(crate) fn output_schema(expected: usize) -> Value {
     })
 }
 
+/// The same `id`/`text` pairs a provider receives, without the surrounding
+/// request. The command provider uses it to hand source segments to an
+/// external process that has no other way to learn which id to echo back.
+pub(crate) fn segments_json(segments: &[String]) -> String {
+    let input: Vec<TranslationInputSegment<'_>> = segments
+        .iter()
+        .enumerate()
+        .map(|(id, text)| TranslationInputSegment { id, text })
+        .collect();
+    serde_json::to_string(&input).expect("translation input always serializes")
+}
+
 fn translation_system_prompt(request: &TranslationRequest) -> String {
     let source = request
         .source_language

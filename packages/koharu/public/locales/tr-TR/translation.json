@@ -321,6 +321,7 @@
   "providerDescriptions": {
     "caiyun": "Caiyun çeviri API'si.",
     "claude": "Anthropic Claude modelleri.",
+    "command": "Kendi komut satırı aracınızla yapılan çeviriler.",
     "deepl": "DeepL çeviri API'si.",
     "deepseek": "DeepSeek dil modelleri.",
     "gemini": "Google Gemini modelleri.",
