@@ -14,6 +14,7 @@ icon: 'plug'
 | 托管模型   | OpenAI、Gemini、Claude、Grok、MiniMax、DeepSeek、OpenRouter |
 | 兼容服务器 | LM Studio、OpenAI 兼容端点                                               |
 | 机器翻译   | DeepL、Google Cloud Translation、Caiyun                                  |
+| 命令接入   | 通过 Koharu 服务器应答的外部命令                                        |
 
 各服务商负责默认端点、请求映射和模型发现。可用模型可能独立于文档更新而变化。
 
@@ -33,6 +34,17 @@ icon: 'plug'
   </Step>
   <Step title='先试一页'>检查原文 OCR，翻译当前页并审阅响应，再处理整章。</Step>
 </Steps>
+
+## 外部命令
+
+`command` 服务商不调用托管 API，而是运行你自己的程序。配置参数向量后，`{{id}}` 与 `{{text}}` 会按文本块替换。该向量不经过 shell 直接执行，因此替换后的文本即使包含引号或换行也不会改变命令本身。`timeout_secs` 限制单个文本块的耗时，`segments_per_chunk` 则在进程数量与单页出错时的损失之间取舍。
+
+命令本身不返回翻译结果。它通过向运行中的 Koharu 服务器调用 `koharu.submit_translations` 工具来应答，传入 `{{id}}` 中给出的块 id，以及每个源文本段对应的一条结果。
+
+<Note>
+  该服务商需要 `koharu-rpc` 服务端传输通道。桌面应用没有应答通道，因此在其中选择 `command` 会在运行到
+  翻译阶段时失败。
+</Note>
 
 ## 凭据与隐私
 

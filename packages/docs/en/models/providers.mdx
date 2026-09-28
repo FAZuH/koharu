@@ -14,6 +14,7 @@ The translation picker combines local and hosted backends. A selection records t
 | Hosted models       | OpenAI, Gemini, Claude, Grok, MiniMax, DeepSeek, OpenRouter |
 | Compatible servers  | LM Studio and OpenAI-compatible endpoints                                |
 | Machine translation | DeepL, Google Cloud Translation, Caiyun                                  |
+| Command provider    | An external command that answers through a Koharu server |
 
 Each provider owns its endpoint defaults, request mapping, and model discovery. Available models can change independently of these docs.
 
@@ -40,6 +41,17 @@ Each provider owns its endpoint defaults, request mapping, and model discovery. 
     processing a chapter.
   </Step>
 </Steps>
+
+## External command
+
+The `command` provider runs your own program instead of a hosted API. Configure an argument vector; `{{id}}` and `{{text}}` are substituted per chunk, and the vector is executed directly without a shell, so a placeholder may expand to text containing quotes or newlines without changing the command. `timeout_secs` bounds a single chunk, and `segments_per_chunk` trades process count against how much work one bad page loses.
+
+The command never returns a translation itself. It answers by calling the `koharu.submit_translations` tool on a running Koharu server, passing the chunk id it was given in `{{id}}` and one entry per source segment.
+
+<Note>
+  This provider needs the `koharu-rpc` server transport. The desktop app has no submission channel, so
+  selecting `command` there fails when a run reaches translation.
+</Note>
 
 ## Credentials and privacy
 
