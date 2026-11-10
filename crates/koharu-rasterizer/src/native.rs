@@ -10,7 +10,6 @@ use vello::{
     AaConfig, AaSupport, RenderParams, RendererOptions, Scene,
     kurbo::Affine,
     peniko::Color,
-    util::RenderContext,
     wgpu::{
         self, Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d,
         TexelCopyBufferInfo, Texture, TextureDescriptor, TextureFormat, TextureUsages, TextureView,
@@ -80,8 +79,8 @@ pub struct Raster {
 }
 
 struct GpuState {
-    context: RenderContext,
-    device_id: usize,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
     renderer: vello::Renderer,
     compositor: GpuCompositor,
     targets: Vec<RenderTarget>,
@@ -107,22 +106,20 @@ impl Rasterizer {
     }
 
     fn try_new() -> AnyResult<Self> {
-        let mut context = RenderContext::new();
-        let device_id = pollster::block_on(context.device(None))
-            .context("no WGPU adapter supports Vello's required features")?;
+        let (device, queue) = pollster::block_on(request_device())?;
         let renderer = vello::Renderer::new(
-            &context.devices[device_id].device,
+            &device,
             RendererOptions {
                 antialiasing_support: AaSupport::area_only(),
                 ..Default::default()
             },
         )
         .map_err(|error| anyhow!("failed to create Vello renderer: {error:?}"))?;
-        let compositor = GpuCompositor::new(&context.devices[device_id].device);
+        let compositor = GpuCompositor::new(&device);
         Ok(Self {
             gpu: Mutex::new(GpuState {
-                context,
-                device_id,
+                device,
+                queue,
                 renderer,
                 compositor,
                 targets: Vec::new(),
@@ -269,14 +266,13 @@ impl Rasterizer {
         let (device, submission, target) = {
             let mut gpu = self.gpu.lock();
             let GpuState {
-                context,
-                device_id,
+                device,
+                queue,
                 renderer,
                 compositor,
                 targets,
             } = &mut *gpu;
-            let device = context.devices[*device_id].device.clone();
-            let queue = &context.devices[*device_id].queue;
+            let device = device.clone();
             check_device_limit(&device, width, height)?;
             let target = take_target(targets, &device, width, height)?;
             compositor
@@ -310,7 +306,8 @@ impl Rasterizer {
             let submission = queue.submit([encoder.finish()]);
             (device, submission, target)
         };
-        self.finish_readback(device, submission, target)
+        // Compositor targets are premultiplied; native images expose straight RGBA.
+        self.finish_readback(device, submission, target, true)
     }
 
     fn readback_scene(
@@ -328,14 +325,13 @@ impl Rasterizer {
         let (device, submission, target) = {
             let mut gpu = self.gpu.lock();
             let GpuState {
-                context,
-                device_id,
+                device,
+                queue,
                 renderer,
                 compositor: _,
                 targets,
             } = &mut *gpu;
-            let device = context.devices[*device_id].device.clone();
-            let queue = &context.devices[*device_id].queue;
+            let device = device.clone();
             check_device_limit(&device, width, height)?;
             let target = take_target(targets, &device, width, height)?;
             renderer
@@ -370,7 +366,7 @@ impl Rasterizer {
             let submission = queue.submit([encoder.finish()]);
             (device, submission, target)
         };
-        self.finish_readback(device, submission, target)
+        self.finish_readback(device, submission, target, false)
     }
 
     fn finish_readback(
@@ -378,6 +374,7 @@ impl Rasterizer {
         device: wgpu::Device,
         submission: wgpu::SubmissionIndex,
         target: RenderTarget,
+        premultiplied: bool,
     ) -> AnyResult<Vec<u8>> {
         let width = target.width;
         let height = target.height;
@@ -396,14 +393,32 @@ impl Rasterizer {
             .recv()
             .context("WGPU closed the readback channel")?
             .context("failed to map WGPU readback buffer")?;
-        let mapped = slice.get_mapped_range();
+        let mapped = slice
+            .get_mapped_range()
+            .context("failed to read mapped WGPU readback buffer")?;
         let row_len = (width * 4) as usize;
         let mut pixels = Vec::with_capacity(row_len * height as usize);
         for row in mapped
             .chunks_exact(target.padded_width as usize)
             .take(height as usize)
         {
+            let start = pixels.len();
             pixels.extend_from_slice(&row[..row_len]);
+            if premultiplied {
+                for pixel in pixels[start..].as_chunks_mut::<4>().0 {
+                    match pixel[3] {
+                        0 => pixel.fill(0),
+                        255 => {}
+                        alpha => {
+                            let alpha = u32::from(alpha);
+                            for channel in &mut pixel[..3] {
+                                *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha)
+                                    .min(255) as u8;
+                            }
+                        }
+                    }
+                }
+            }
         }
         drop(mapped);
         target.readback.unmap();
@@ -413,6 +428,39 @@ impl Rasterizer {
         }
         Ok(pixels)
     }
+}
+
+/// Creates the device as Vello's `RenderContext::device` does, but with the
+/// adapter's texture and buffer limits. Vello requests `Limits::default()`,
+/// which caps every surface at 8192 px and its readback at 256 MiB whatever
+/// the GPU supports.
+async fn request_device() -> AnyResult<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        display: None,
+        backends: wgpu::Backends::from_env().unwrap_or_default(),
+        flags: wgpu::InstanceFlags::from_build_config().with_env(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::from_env_or_default(),
+    });
+    let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None)
+        .await
+        .context("no WGPU adapter is available")?;
+    let supported = adapter.limits();
+    let required_limits = wgpu::Limits {
+        max_texture_dimension_2d: supported.max_texture_dimension_2d,
+        max_buffer_size: supported.max_buffer_size,
+        ..wgpu::Limits::default()
+    };
+    let optional_features = wgpu::Features::CLEAR_TEXTURE | wgpu::Features::PIPELINE_CACHE;
+    adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("koharu rasterizer device"),
+            required_features: adapter.features() & optional_features,
+            required_limits,
+            ..Default::default()
+        })
+        .await
+        .context("no WGPU adapter supports Vello's required features")
 }
 
 fn checked_surface(width: u32, height: u32) -> AnyResult<()> {

@@ -5,13 +5,16 @@ import LanguageDetector from 'i18next-browser-languagedetector'
 import LocalStorageBackend from 'i18next-localstorage-backend'
 import { initReactI18next } from 'react-i18next'
 
+import ar from '@/public/locales/ar/translation.json'
 import enUS from '@/public/locales/en-US/translation.json'
 import esES from '@/public/locales/es-ES/translation.json'
+import frFR from '@/public/locales/fr-FR/translation.json'
 import jaJP from '@/public/locales/ja-JP/translation.json'
 import koKR from '@/public/locales/ko-KR/translation.json'
 import ptBR from '@/public/locales/pt-BR/translation.json'
 import ruRU from '@/public/locales/ru-RU/translation.json'
 import trTR from '@/public/locales/tr-TR/translation.json'
+import wuu from '@/public/locales/wuu/translation.json'
 import zhCN from '@/public/locales/zh-CN/translation.json'
 import zhTW from '@/public/locales/zh-TW/translation.json'
 
@@ -25,6 +28,9 @@ export const resources = {
   'tr-TR': { translation: trTR },
   'ko-KR': { translation: koKR },
   'pt-BR': { translation: ptBR },
+  wuu: { translation: wuu },
+  'fr-FR': { translation: frFR },
+  ar: { translation: ar },
 } satisfies Resource
 
 export type SupportedLanguage = keyof typeof resources

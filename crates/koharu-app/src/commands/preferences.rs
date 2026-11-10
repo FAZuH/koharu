@@ -150,12 +150,6 @@ pub struct LanguageChoice {
     pub name: String,
 }
 
-#[tracing::instrument(
-    target = "koharu_metrics",
-    name = "preferences_saved",
-    skip_all,
-    fields(setting = "application")
-)]
 #[tauri::command]
 #[specta::specta]
 pub(crate) async fn save_preferences(
@@ -183,13 +177,7 @@ pub(crate) async fn save_preferences(
         *current = typesetting;
         current.save()?;
     }
-    let preferences = Preferences::load()?;
-    tracing::info!(
-        target: "koharu_metrics",
-        metric = "preference_changed",
-        setting = "application",
-    );
-    Ok(preferences)
+    Ok(Preferences::load()?)
 }
 
 fn remember_pipeline_profiles(config: &mut PipelineConfig) {
